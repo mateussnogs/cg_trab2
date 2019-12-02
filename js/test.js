@@ -8,20 +8,61 @@ var controls;
 var raycaster = new THREE.Raycaster();
 var mouse = new THREE.Vector2();
 var plane = new THREE.Plane();
-var guiPlane = new THREE.Plane();
 var planeNormal = new THREE.Vector3();
-var control_points = [];
+
+// array central que eh utilizado ao longo do programa todo para acessar e modificar os pontos de controle
+var controlPoints = [];
+
 var movingControlPoint = false;
+
+// array que armazena os pontos da curva desenhada utilizado para alterar a curva quando algum ponto de controle é movido
 var curvePoints = [];
-var curveResolution = 100;
+
+// numero de pontos por spline
+var curveResolution = 50;
 
 var gui = new dat.GUI();
 var selectedPoint;
+
+// armazena a curva sendo desenhada para saber qual aplicar no movimento dos pontos de controle
 var selectedCurve;
+
+/* Variaveis que auxiliam na construcao das hermite splines
+ pela necessidade de especificar as derivadas nos pontos de controle.
+ */
+var hermiteState = false; // determina se um usuario esta, ou nao, especificando as derivadas nos pts de controle
+var arrowHelper; // derivada
+var dir, edge; // direcao e ponta do vetor que especifica a derivada
+var arrowAdded = false;
+var hermiteStateNum = 0; // indice do potno de controle que será usado para associar uma derivada
+var derivatives = []; // array usado para alterar as derivadas quando um pto de controle associado é reposicionado
+var edges = []; // pontas das derivadas para poder reconstrui-las apos reposicionamento de pts de controle
+
+// opcoes da GUI
 var options = {
   tightness: 0.8,
+  bezier: function() {
+    cleanCurve();
+    drawCurve(bezier, getPointsPositions(controlPoints));
+    selectedCurve = "bezier";
+  },
+  hermite: function() {
+    cleanCurve();
+    hermiteState = true;
+    selectedCurve = "hermite";
+  },
+  cardinal: function() {
+    cleanCurve();
+    drawCardinalSplines(cardinal, getPointsPositions(controlPoints));
+    selectedCurve = "cardinal";
+  },
+  catmullrom: function() {
+    cleanCurve();
+    drawCardinalSplines(catmullrom, getPointsPositions(controlPoints));
+    selectedCurve = "catmull";
+  },
   clean: function() {
-    control_points = [];
+    controlPoints = [];
     hermDerivatives = [];
     hermiteStateNum = 0;
     arrowAdded = false;
@@ -31,29 +72,32 @@ var options = {
       scene.remove(scene.children[0]);      
     }
   },
-  bezier: function() {
-    drawCurve(bezier, getPointsPositions(control_points));
-    selectedCurve = "bezier";
+  CleanCurve: function() {
+    cleanCurve();
   },
-  hermite: function() {
-    hermiteState = true;
-    selectedCurve = "hermite";
-  },
-  cardinal: function() {
-    drawCardinalSplines(cardinal, getPointsPositions(control_points));
-    selectedCurve = "cardinal";
-  },
-  catmullrom: function() {
-    drawCardinalSplines(catmullrom, getPointsPositions(control_points));
-    selectedCurve = "catmull";
-  }
 };
-gui.add(options, 'clean');
-gui.add(options, 'bezier');
-gui.add(options, 'hermite');
-gui.add(options, 'cardinal');
-gui.add(options, 'catmullrom');
-gui.add(options, 'tightness', 0, 1).listen();
+
+function fillGUI() {
+  gui.add(options, 'bezier');
+  gui.add(options, 'hermite');
+  gui.add(options, 'cardinal');
+  gui.add(options, 'catmullrom');
+  gui.add(options, 'tightness', 0, 1).listen().onChange(redrawCardinalSpline);
+  gui.add(options, 'clean');
+  gui.add(options, 'CleanCurve');
+}
+fillGUI();
+
+/* funcao chamada toda vez que o parametro tightness eh modificado na GUI.
+Como o parametro eh utilizado apenas para cardinal splines,
+somente para esse tipo de curva essa funcao tem efeito.
+*/
+function redrawCardinalSpline() {
+  if (selectedCurve == 'cardinal') {
+    cleanCurve();
+    drawCardinalSplines(cardinal, getPointsPositions(controlPoints));
+  }
+}
 var init = function() {
 
     scene = new THREE.Scene();
@@ -62,14 +106,12 @@ var init = function() {
     renderer = new THREE.WebGLRenderer();
     renderer.setSize( window.innerWidth, window.innerHeight );
     // controls = new THREE.OrbitControls(camera, renderer.domElement);
-    // document.body.appendChild( renderer.domElement );
     document.getElementById("scene").appendChild(renderer.domElement);
     document.getElementById("scene").addEventListener("mousedown", onMouseDown, false);
     document.getElementById("scene").addEventListener("mousemove", onMouseMove, false);
     document.getElementById("scene").addEventListener("mouseup", onMouseUp, false);
 
     this.render();
-
 };
 
 
@@ -90,10 +132,20 @@ function combination(k, i) {
   return factorial(k)/(factorial(k-i)*factorial(i));
 }
 
+// procura qualquer ponto da curva que ainda esta na cena e retorna o indice do objeto na cena
+function curveHasPoints() {
+  for (var i = 0; i < scene.children.length; i++)
+    if (scene.children[i].name == "curve")
+      return i;
+  return false;
+}
+
+// procura e remove pontos de curva ate que nao haja nenhum
 function cleanCurve() {
-  for(var object of scene.children) { 
-    if (object.name == "curve")
-      scene.remove(object);      
+  var i = curveHasPoints();
+  while (i) {
+    scene.remove(scene.children[i]);
+    i = curveHasPoints();
   }
 }
 
@@ -107,10 +159,11 @@ function getPointsPositions(cpoints) {
   return positions;
 }
 
+// aplica bezier em todos os pontos de controle e retorna os pontos que compoem a curva
 function bezier(cpoints) {
   points = []
   k = cpoints.length-1; // grau da curva
-  for (u = 0; u <= 1; u += 0.001) {
+  for (u = 0; u <= 1; u += 1/curveResolution) {
     p = new THREE.Vector2();    
     for ( i = 0; i < k+1; i++) {
       cp = new THREE.Vector2(cpoints[i].x, cpoints[i].y);
@@ -121,14 +174,14 @@ function bezier(cpoints) {
   return points;
 }
 
-var hermiteState = false;
+// aplica hermite em 4 pontos de controle para compor uma hermite spline
 function hermite(cpoints) { 
   p1 = new THREE.Vector2(cpoints[0].x, cpoints[0].y);
   d1 = new THREE.Vector2(cpoints[1].x, cpoints[1].y);
   p2 = new THREE.Vector2(cpoints[2].x, cpoints[2].y);
   d2 = new THREE.Vector2(cpoints[3].x, cpoints[3].y);
   points = [];  
-  for (u = 0; u <= 1; u += 0.01) {    
+  for (u = 0; u <= 1; u += 1/curveResolution) {    
     p = new THREE.Vector2(0, 0);
     h1 = 1 - 3*Math.pow(u, 2) + 2*Math.pow(u, 3);
     h2 = u - 2*Math.pow(u, 2) + Math.pow(u, 3);
@@ -143,11 +196,14 @@ function hermite(cpoints) {
   return points;
 }
 
+// Aplica catmullrom em 4 pontos de controle para compor uma catmullrom spline.
+// Eh um caso particular de cardinal spline.
 function catmullrom(cpoints) {
   options.tightness = 0.5;
   return cardinal(cpoints);
 }
 
+// Aplica catmullrom em 4 pontos de controle para compor uma cardinal spline.
 function cardinal(cpoints) {
   var p1 = new THREE.Vector2(cpoints[1].x, cpoints[1].y);
   var d1 = new THREE.Vector2(cpoints[2].x-cpoints[0].x, cpoints[2].y-cpoints[0].y);  
@@ -157,7 +213,7 @@ function cardinal(cpoints) {
   d2 = d2.clone().multiplyScalar(options.tightness);
 
   points = [];
-  for (u = 0; u <= 1; u += 0.01) {    
+  for (u = 0; u <= 1; u += 1/curveResolution) {    
     p = new THREE.Vector2(0, 0);
     h1 = 1 - 3*Math.pow(u, 2) + 2*Math.pow(u, 3);
     h2 = u - 2*Math.pow(u, 2) + Math.pow(u, 3);
@@ -173,6 +229,7 @@ function cardinal(cpoints) {
   return points;
 }
 
+// Considera todos os pontos de controle para desenhar todas as cardinal splines.
 function drawCardinalSplines(cardinalf, cpoints) {
   for (i = 0; i < cpoints.length-3; i++) {
     cardinal_points = [];
@@ -183,6 +240,7 @@ function drawCardinalSplines(cardinalf, cpoints) {
   }
 }
 
+// Muda os pontos das cardinal splines caso algum ponto de controle tenha sido reposicionado.
 function changeCardinalCurves(cardinalf, cpoints) {
   for (i = 0; i < cpoints.length-3; i++) {
     cardinal_points = [];
@@ -198,6 +256,7 @@ function changeCardinalCurves(cardinalf, cpoints) {
   }
 }
 
+// Desenha uma curva completa (e.g. bezier) ou uma spline determinada pelo parametro blending.
 function drawCurve(blending, cpoints) {
     points = blending(cpoints);
     for (p of points) {
@@ -206,7 +265,8 @@ function drawCurve(blending, cpoints) {
     }    
 }
 
-function changeCurve(blending, cpoints) {  
+// Muda os pontos de uma curva de bezier ja existente caso algum ponto de controle tenha sido reposicionado.
+function changeBezierCurve(blending, cpoints) {  
   var new_points = blending(getPointsPositions(cpoints));
   var i = 0;
   for (var i = 0; i < curvePoints.length; i++) {
@@ -214,13 +274,7 @@ function changeCurve(blending, cpoints) {
   }
 }
 
-function drawPoints(points) {
-  for (p of points) {
-    p3d = new THREE.Vector3(p.x, p.y, 0);
-    setPoint(p3d);
-  } 
-}
-
+// Checa se algum ponto de controle foi clicado e o seleciona.
 function hasClickedControlPoint() {
   var point = new THREE.Vector3();
   var raycaster = new THREE.Raycaster();
@@ -238,6 +292,7 @@ function hasClickedControlPoint() {
   return false;
 }
 
+// Retorna a posicao do mouse na tela.
 function getPoint(event) {
     var point = new THREE.Vector3();
     mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
@@ -249,6 +304,9 @@ function getPoint(event) {
     return point;
   }
   
+  /* Desenha um circulo, representando um ponto, em uma determinada posicao
+   Retorna o id dele para poder atualizar a posicao do ponto de controle quando alterada.
+   */
   function setPoint(position, isControlPoint = false) {
     var radius = 0.01;
     var segments = 5;
@@ -269,7 +327,10 @@ function getPoint(event) {
     return circle.id;
   }
 
-  function finishHermite(cpoints) {
+  /*
+  Chamada apos o usuario terminar de especificar todas as derivadas relacionadas aos pontos de controle.
+  */
+  function finishHermiteSplines(cpoints) {
     hermiteState = false;
     hermPoints = [];
     j = 0;
@@ -283,6 +344,9 @@ function getPoint(event) {
     }
   }
 
+  /*
+  Muda os pontos das hermite splines ja desenhadas caso algum ponto de controle tenha sido reposicionado.
+  */
   function changeHermite(cpoints) {
     hermiteState = false;
     hermPoints = [];
@@ -298,32 +362,33 @@ function getPoint(event) {
         curvePoints[k].position.copy(new THREE.Vector3(new_points[v].x, new_points[v].y, 0));
         v++;
       }
-      // drawCurve(hermite, hermPoints);
       hermPoints = [];                    
     }
   }
   
-  var count = 0;
+  // Chamada ao clicar.
   function onMouseDown(event) {    
-    if (document.activeElement.id != "corpo") { // resolve o problema do raycasting atingir a GUI
+    if (document.activeElement.id != "corpo") { // resolve o problema do raycast atingir a GUI
       return;
     }
     if (hermiteState) {
-      hermiteStateNum++;
-      control_points.push({'id': --pointId, 'position':dir});
-      derivatives.push(arrowHelper);
+      hermiteStateNum++; // passa para a especificacao da derivada do proximo pto de controle!
+      controlPoints.push({'id': --pointId, 'position':dir}); // derivadas tbm sao ptos de controle
+      derivatives.push(arrowHelper); // guarda seta/derivada para poder reposicionar junto com o pto de controle
       edges.push(edge);
-      arrowAdded = false;      
-      if (hermiteStateNum > (control_points.length-1)/2) {
-        finishHermite(getPointsPositions(control_points));    
+      arrowAdded = false; // uma nova seta podera ser adicionada de novo
+      numCpointsWithoutDerivatives = (controlPoints.length-1)/2;
+      if (hermiteStateNum > numCpointsWithoutDerivatives) {
+        finishHermiteSplines(getPointsPositions(controlPoints));    
         hermiteState = false;    
       }
       return;
     }
     point = getPoint(event);
+    // se nao houve clique em um ponto de controle, entao um novo ponto de controle esta sendo adicionado
     if (!hasClickedControlPoint()) {      
       pointId = setPoint(point, isControlPoint=true);
-      control_points.push({'id': pointId, 'position': new THREE.Vector2(point.x, point.y)});      
+      controlPoints.push({'id': pointId, 'position': new THREE.Vector2(point.x, point.y)});      
     } else {
       movingControlPoint = true;
     }
@@ -339,16 +404,21 @@ function getPoint(event) {
     }
   }
   
-  var arrowHelper;
-  var dir, edge;
-  var arrowAdded = false;
-  var hermiteStateNum = 0; // control point que será usado para pegar a derivada
-  var derivatives = [];
-  var edges = [];
+  function findCPointById(id) {
+    cpointIndex = -1;
+    for (var i = 0; i < controlPoints.length; i++) { 
+      if (controlPoints[i]['id'] == id) {         
+        cpointChangedIndex = i;
+        return i;
+      }
+    }
+    return cpointIndex;
+  }
+
   function onMouseMove(event) {
     if (hermiteState) {
       edge = getPoint(event);
-      var origin = control_points[hermiteStateNum]['position'];
+      var origin = controlPoints[hermiteStateNum]['position'];
       origin = new THREE.Vector3(origin.x, origin.y, 0);
       dir = edge.clone().sub(origin);
   
@@ -360,42 +430,41 @@ function getPoint(event) {
         scene.add( arrowHelper );
       }
       else {
-        arrowHelper.setDirection(dir);
+        arrowHelper.setDirection(dir); // se a seta ja esta na cena, mude a direcao quando mover o mouse
       }
     }
     if (movingControlPoint) {
         new_pos = getPoint(event);
         selectedPoint.position.copy(new_pos);
-        // atualiza control points de acordo com o ponto em movimento
-        for (var i = 0; i < control_points.length; i++) { 
-          if (control_points[i]['id'] == selectedPoint.id) {
-            control_points[i]['position'] = new THREE.Vector2(new_pos.x, new_pos.y);
-            switch (selectedCurve) {
-              case 'bezier':
-                  changeCurve(bezier, control_points);
-                  break;
-              case 'hermite':
-                  translateDerivatives(i);
-                  changeHermite(control_points);                  
-                  break;
-              case 'cardinal':
-                  changeCardinalCurves(cardinal, control_points);
-                  break;
-              case 'catmull':                  
-                  changeCardinalCurves(catmullrom, control_points);
-                  break;                                    
-            }
+        cpointChangedIndex = findCPointById(selectedPoint.id);
+        if (cpointChangedIndex > -1) {  
+          controlPoints[cpointChangedIndex]['position'] = new THREE.Vector2(new_pos.x, new_pos.y);          
+          switch (selectedCurve) {
+            case 'bezier':
+                changeBezierCurve(bezier, controlPoints);
+                break;
+            case 'hermite':
+                translateDerivatives(cpointChangedIndex);
+                changeHermite(controlPoints);                  
+                break;
+            case 'cardinal':
+                changeCardinalCurves(cardinal, controlPoints);
+                break;
+            case 'catmull':                  
+                changeCardinalCurves(catmullrom, controlPoints);
+                break;                                    
           }
-        }
+      }
     }
   }
 
+// Faz as derivadas acompanharem seus pontos de controle associados.
 function translateDerivatives(cpointIndex) {
-  var numCp = control_points.length;
-  var d = control_points[cpointIndex+numCp/2];
+  var numCp = controlPoints.length;
+  var d = controlPoints[cpointIndex+numCp/2];
   var e = edges[cpointIndex];
-  var cp = control_points[cpointIndex]['position'];
-  control_points[cpointIndex+numCp/2] = {'id': d['id'], 'position': new THREE.Vector2(e.x-cp.x, e.y-cp.y)};
+  var cp = controlPoints[cpointIndex]['position'];
+  controlPoints[cpointIndex+numCp/2] = {'id': d['id'], 'position': new THREE.Vector2(e.x-cp.x, e.y-cp.y)};
 
   derivatives[cpointIndex].position.copy(new THREE.Vector3(cp.x, cp.y, 0));
 }
